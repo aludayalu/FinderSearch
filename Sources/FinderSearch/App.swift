@@ -81,7 +81,7 @@ import UniformTypeIdentifiers
                     model?.forwardStack.isEmpty != false)
                 Button("Enclosing Folder") {
                     if let model { model.navigate(model.location.deletingLastPathComponent()) }
-                }.keyboardShortcut(.upArrow)
+                }.keyboardShortcut(.upArrow, modifiers: [.command])
                 Button("Go to Folder…") { model?.goToFolder() }.keyboardShortcut(
                     "g", modifiers: [.command, .shift])
                 Button("Home") { model?.navigate(FileManager.default.homeDirectoryForCurrentUser) }
@@ -93,13 +93,15 @@ import UniformTypeIdentifiers
                         model?.viewMode = FileViewMode.allCases[index]
                     }.keyboardShortcut(KeyEquivalent(Character(String(index + 1))))
                 }
-                Button("Show Hidden Files") { model?.showHidden.toggle() }.keyboardShortcut(
-                    ".", modifiers: [.command, .shift])
+                Button("Show Hidden Files") { model?.toggleHidden() }.keyboardShortcut(
+                    "h", modifiers: [.command])
                 Button("Refresh") { model?.schedule() }.keyboardShortcut("r")
                 Button("Search") {
                     NotificationCenter.default.post(name: .focusSearch, object: nil)
                 }.keyboardShortcut("f")
             }
+            // The stock Hide command uses ⌘H; reclaim it for Show Hidden Files.
+            CommandGroup(replacing: .appVisibility) {}
         }
     }
     private func textOrFile(_ selector: String, action: () -> Void) {
@@ -130,6 +132,7 @@ struct BrowserView: View {
     @State private var browserWindow: NSWindow?
     @State private var iconSize: Double = 64
     @State private var gridColumns = 5
+    // Tags submenu of the actions menu; the toolbar tag button was removed.
     private let tags = SidebarTags.values
     var body: some View {
         NavigationSplitView {
@@ -186,7 +189,7 @@ struct BrowserView: View {
                     }
                 }
                 ToolbarItem {
-                    ViewModePicker(selection: $model.viewMode).frame(width: 150, height: 28)
+                    ViewModePicker(selection: $model.viewMode).frame(width: 84, height: 28)
                 }
                 ToolbarItem {
                     Menu {
@@ -196,22 +199,19 @@ struct BrowserView: View {
                             }
                         }
                         Toggle("Ascending", isOn: $model.ascending)
-                        Toggle("Show Hidden Files", isOn: $model.showHidden)
+                        Divider()
+                        Picker("Group By", selection: Binding(
+                            get: { model.grouping }, set: { model.setGrouping($0) })
+                        ) {
+                            ForEach(FileGrouping.allCases, id: \.self) { grouping in
+                                Text(grouping.title).tag(grouping)
+                            }
+                        }
+                        Toggle("Show Hidden Files", isOn: Binding(
+                            get: { model.showHidden }, set: { _ in model.toggleHidden() }))
                     } label: {
                         Image(systemName: "arrow.up.arrow.down")
                     }.help("Sort")
-                }
-                ToolbarItem {
-                    ShareLink(items: model.selectedItems.map(\.url)) {
-                        Image(systemName: "square.and.arrow.up")
-                    }.disabled(model.selection.isEmpty).help("Share")
-                }
-                ToolbarItem {
-                    Menu {
-                        ForEach(tags, id: \.0) { name, _ in Button(name) { model.tag(name) } }
-                    } label: {
-                        Image(systemName: "tag")
-                    }.disabled(model.selection.isEmpty).help("Tags")
                 }
                 ToolbarItem {
                     Menu {
@@ -291,19 +291,68 @@ struct BrowserView: View {
             if searchFocused && event.keyCode == 125 && !model.sortedHits.isEmpty {
                 focusFiles(); model.selection = [model.sortedHits[0].path]; return nil
             }
+            // ⌘H toggles hidden files anywhere in the browser (except while
+            // typing); the stock Hide command is replaced above.
+            if event.modifierFlags.intersection([.control, .option]).isEmpty,
+                event.modifierFlags.contains(.command), !event.modifierFlags.contains(.shift),
+                event.keyCode == 4,
+                !(NSApp.keyWindow?.firstResponder is NSTextView),
+                !(NSApp.keyWindow?.firstResponder is NSTextField)
+            {
+                model.toggleHidden(); return nil
+            }
             guard NSApp.keyWindow?.isSheet != true, model.preview == nil,
                 fileNavigationActive && !searchFocused,
                 !(NSApp.keyWindow?.firstResponder is NSTextView)
             else { return event }
             if event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
-                if event.keyCode == 49 { model.preview = model.selected; return nil }
-                if event.keyCode == 36 { model.rename(); return nil }
-                if event.keyCode == 53 { model.selection = []; return nil }
-                if (model.viewMode == .icons || model.viewMode == .gallery
-                    || (model.viewMode == .columns && [125, 126].contains(event.keyCode))),
-                    [123, 124, 125, 126].contains(event.keyCode)
+                // Power-user file keys: Space renames, Return opens, arrows
+                // move in every view, Escape clears. Finder parity for Tab
+                // (next item) and type-ahead (jump to a name) follows below.
+                switch event.keyCode {
+                case 49: model.renameItems(); return nil
+                case 36, 76: model.open(); return nil
+                case 53: model.selection = []; return nil
+                case 48:
+                    model.moveSelection(
+                        by: event.modifierFlags.contains(.shift) ? -1 : 1, extending: false)
+                    return nil
+                case 123, 124, 125, 126:
+                    let stride = model.viewMode == .icons && event.keyCode != 123
+                        && event.keyCode != 124 ? gridColumns : 1
+                    let delta =
+                        event.keyCode == 123
+                        ? -1
+                        : event.keyCode == 124 ? 1 : event.keyCode == 125 ? stride : -stride
+                    model.moveSelection(
+                        by: delta, extending: event.modifierFlags.contains(.shift))
+                    return nil
+                default: break
+                }
+                if let characters = event.charactersIgnoringModifiers,
+                    characters.count == 1,
+                    characters.rangeOfCharacter(from: .alphanumerics) != nil
                 {
-                    let stride = model.viewMode == .icons ? gridColumns : 1
+                    model.jumpToPrefix(characters)
+                    return nil
+                }
+            } else if event.modifierFlags.intersection([.control, .option]).isEmpty {
+                if [123, 124, 125, 126].contains(event.keyCode) {
+                    // ⌘↑ opens the enclosing folder, Finder-style.
+                    if event.modifierFlags.contains(.command), event.keyCode == 126,
+                        !event.modifierFlags.contains(.shift)
+                    {
+                        model.navigate(model.location.deletingLastPathComponent())
+                        return nil
+                    }
+                    // ⌘↓ opens the selection, Finder-style.
+                    if event.modifierFlags.contains(.command), event.keyCode == 125,
+                        !event.modifierFlags.contains(.shift)
+                    {
+                        model.open(); return nil
+                    }
+                    let stride = model.viewMode == .icons && event.keyCode != 123
+                        && event.keyCode != 124 ? gridColumns : 1
                     let delta =
                         event.keyCode == 123
                         ? -1
@@ -312,9 +361,6 @@ struct BrowserView: View {
                         by: delta, extending: event.modifierFlags.contains(.shift))
                     return nil
                 }
-            }
-            if event.modifierFlags.contains(.command), event.keyCode == 125 {
-                model.open(); return nil
             }
             return event
         }
@@ -379,7 +425,17 @@ struct BrowserView: View {
                     columns: [GridItem(.adaptive(minimum: iconSize + 55), spacing: 14)],
                     alignment: .leading, spacing: 18
                 ) {
-                    ForEach(model.sortedHits) { hit in iconCell(hit) }
+                    if let sections = model.groupedSections {
+                        ForEach(sections) { section in
+                            Section {
+                                ForEach(section.items) { hit in iconCell(hit) }
+                            } header: {
+                                iconGroupHeader(section.title, count: section.items.count)
+                            }
+                        }
+                    } else {
+                        ForEach(model.sortedHits) { hit in iconCell(hit) }
+                    }
                 }.scrollTargetLayout().padding(18)
                     .frame(minHeight: minHeight, alignment: .top)
                     .marqueeSelection(model: model, focusFiles: focusFiles)
@@ -389,6 +445,14 @@ struct BrowserView: View {
                 if !model.marqueeSelecting, let path { proxy.scrollTo(path) }
             }
         }
+    }
+    private func iconGroupHeader(_ title: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+            Text("\(count)").font(.system(size: 11)).foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8).padding(.bottom, 2)
     }
     private func iconCell(_ hit: Hit) -> some View {
         VStack(spacing: 6) {
@@ -501,7 +565,8 @@ struct BrowserView: View {
                 Button(mode.title) { model.viewMode = mode }
             }
         }
-        Toggle("Show Hidden Files", isOn: $model.showHidden)
+        Toggle("Show Hidden Files  ⌘H", isOn: Binding(
+            get: { model.showHidden }, set: { _ in model.toggleHidden() }))
         Button("Refresh") { model.schedule() }.disabled(model.busy)
     }
     @ViewBuilder private var actions: some View {

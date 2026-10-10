@@ -19,9 +19,31 @@ enum FileSort: String, CaseIterable {
     case name = "Name", modified = "Date Modified", size = "Size", kind = "Kind", relevance =
         "Relevance"
 }
+/// Home and Downloads paths for per-folder defaults. Plain constants so they
+/// are usable from any isolation domain.
+private let defaultHomePath = NSHomeDirectory()
+private let defaultDownloadsPath =
+    FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?
+    .standardizedFileURL.path ?? NSHomeDirectory() + "/Downloads"
+/// Optional date buckets layered on top of the current sort, Windows Explorer-style.
+enum FileGrouping: String, CaseIterable {
+    case none, dateModified
+    var title: String { self == .dateModified ? "Date Modified" : "None" }
+    var isGrouped: Bool { self == .dateModified }
+    static func defaultFor(path: String) -> FileGrouping {
+        path == defaultDownloadsPath ? .dateModified : .none
+    }
+}
+/// A titled run of file rows. `items` preserve the flat display order.
+struct FileSection: Identifiable {
+    var id: String { title }
+    let title: String
+    let items: [Hit]
+}
 struct FileJournal { let name: String; let operations: [FileMutation] }
 
 @MainActor final class SearchModel: ObservableObject, Identifiable {
+    static var homePath: String { defaultHomePath }
     let id = UUID()
     @Published var location = URL(fileURLWithPath: NSHomeDirectory())
     @Published var route = NSHomeDirectory()
@@ -52,7 +74,9 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
             selectedCache = nil
             if let renaming, !selection.contains(renaming.path) { cancelRename() }
             if let focusedPath, selection.contains(focusedPath) { return }
-            focusedPath = selection.sorted().first
+            // A removed focus re-anchors to the nearest surviving row in
+            // display order (or clears when nothing remains selected).
+            focusedPath = nearestSelectedRow(to: focusedPath)
             selectionAnchor = focusedPath
         }
     }
@@ -65,7 +89,7 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
         didSet { if scrollAnchor != oldValue { scrollChanges.send() } }
     }
     var scrollOffset: Double = 0
-    private var selectionAnchor: String?
+    var selectionAnchor: String?
     @Published var searching = false
     @Published var loading = false
     @Published private(set) var sorting = false
@@ -100,6 +124,36 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
     @Published var sort: FileSort = .name { didSet { invalidateDerived(preserveOrder: true) } }
     @Published var ascending = true { didSet { invalidateDerived(preserveOrder: true) } }
     @Published var showHidden = false { didSet { invalidateDerived(); schedule() } }
+    /// Per-folder explicit choice. Absent a choice the home folder hides dotfiles
+    /// and every other folder shows them.
+    private var hiddenOverrides: [String: Bool] = [:]
+    private var groupingOverrides: [String: FileGrouping] = [:]
+    static func defaultHidden(for path: String) -> Bool {
+        path == homePath ? false : true
+    }
+    func applyDefaultHidden(for path: String) {
+        guard hiddenOverrides[path] == nil else { return }
+        let value = Self.defaultHidden(for: path)
+        if showHidden != value { showHidden = value }
+    }
+    /// Easy toggle for the current folder; remembers the choice per folder.
+    func toggleHidden() {
+        showHidden.toggle()
+        hiddenOverrides[route] = showHidden
+    }
+    func applyDefaultGrouping(for path: String) {
+        guard groupingOverrides[path] == nil else { return }
+        let value = FileGrouping.defaultFor(path: path)
+        if grouping != value { grouping = value }
+    }
+    /// Remember an explicit grouping choice for the current folder.
+    func setGrouping(_ value: FileGrouping) {
+        grouping = value
+        groupingOverrides[route] = value
+    }
+    @Published var grouping: FileGrouping = .none {
+        didSet { invalidateDerived(preserveOrder: true) }
+    }
     @Published var busy = false
     @Published var operationProgress: FileOperationProgress?
     @Published var operationName = ""
@@ -266,14 +320,58 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
         visibleCache = visible
         return visible
     }
+    /// Date buckets for the current display order. Nil when grouping is off or
+    /// the current mode (search, gallery, columns) renders a flat list.
+    /// Memoized: bucketing thousands of rows reuses the last result.
+    private var sectionInput: [Hit]?
+    private var sectionOutput: [FileSection]?
+    var groupedSections: [FileSection]? {
+        guard grouping.isGrouped, !isSearch,
+            viewMode == .list || viewMode == .icons
+        else { return nil }
+        let current = sortedHits
+        if sectionInput != current {
+            sectionInput = current
+            sectionOutput = FileOrdering.sections(current)
+        }
+        return sectionOutput
+    }
+    private func nearestSelectedRow(to path: String?) -> String? {
+        let items = sortedHits
+        guard !items.isEmpty, !selection.isEmpty else { return nil }
+        guard let path else { return displayFirstSelected(in: items) }
+        if rowIndex == nil { rowIndex = Self.indexRows(items) }
+        guard let rows = rowIndex else { return displayFirstSelected(in: items) }
+        if let removed = rows[path] {
+            for offset in 0..<items.count {
+                if removed + offset < items.count, selection.contains(items[removed + offset].path)
+                {
+                    return items[removed + offset].path
+                }
+                if removed - offset >= 0, selection.contains(items[removed - offset].path) {
+                    return items[removed - offset].path
+                }
+            }
+            return nil
+        }
+        return displayFirstSelected(in: items)
+    }
+    private func displayFirstSelected(in items: [Hit]) -> String? {
+        items.first { selection.contains($0.path) }?.path
+    }
     func select(_ hit: Hit, extending: Bool, toggling: Bool) {
         if toggling {
             if selection.contains(hit.path) {
                 selection.remove(hit.path)
             } else {
-                focusedPath = hit.path; selection.insert(hit.path)
+                selection.insert(hit.path)
+                // Command-click adds without moving the keyboard focus, so a
+                // later Shift-arrow range still grows from the old anchor.
+                if focusedPath == nil || selectionAnchor == nil {
+                    focusedPath = hit.path; selectionAnchor = hit.path
+                }
             }
-            selectionAnchor = focusedPath
+            return
         } else if extending, let anchor = selectionAnchor,
             let start = rowsByPath[anchor],
             let end = rowsByPath[hit.path]
@@ -300,8 +398,28 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
             focusedPath = target
             selection = Set(items[min(start, next)...max(start, next)].map(\.path))
             selectionAnchor = anchor
+        } else if focusedPath == target, selection == [target] {
+            // Already at the edge: keep the row selected, just re-anchor it.
+            selectionAnchor = target
         } else {
             focusedPath = target; selection = [target]; selectionAnchor = target
+        }
+    }
+    /// Finder-style type-ahead: jump to the first visible name with the prefix.
+    func jumpToPrefix(_ prefix: String) {
+        let items = sortedHits
+        guard !items.isEmpty else { return }
+        let rows = rowsByPath
+        let start = (focusedPath.flatMap { rows[$0] } ?? -1) + 1
+        let folded = prefix.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        for offset in 0..<items.count {
+            let hit = items[(start + offset) % items.count]
+            if hit.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                .hasPrefix(folded)
+            {
+                focusedPath = hit.path; selection = [hit.path]; selectionAnchor = hit.path
+                return
+            }
         }
     }
     var ancestors: [URL] {
@@ -323,6 +441,8 @@ struct FileJournal { let name: String; let operations: [FileMutation] }
         if history && url != location { backStack.append(location); forwardStack = [] }
         if url.standardizedFileURL != location { scrollAnchor = nil; scrollOffset = 0 }
         location = url.standardizedFileURL; route = location.path
+        applyDefaultHidden(for: route)
+        applyDefaultGrouping(for: route)
         extraHits = []; scope = ""; query = ""; fileType = ""; selection = []; sort = .name;
         ascending = true
         if let snapshot = snapshots[SnapshotKey(route: route, hidden: showHidden)] {

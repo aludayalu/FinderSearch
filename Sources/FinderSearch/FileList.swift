@@ -33,6 +33,10 @@ import AppKit
         table.target = coordinator; table.doubleAction = #selector(Coordinator.openClicked)
         table.dragExit = { [weak model = model] in model?.springLoader.cancel() }
         table.menuProvider = { [weak coordinator = coordinator] row in coordinator?.menu(for: row) }
+        table.focusHandler = { [weak coordinator = coordinator] in
+            guard let coordinator else { return }
+            coordinator.parent.focusFiles(); coordinator.parent.model.cancelRename()
+        }
         table.registerForDraggedTypes([.fileURL])
         table.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
         table.setDraggingSourceOperationMask([.copy, .move], forLocal: false)
@@ -45,8 +49,8 @@ import AppKit
         marquee.autoresizingMask = [.width, .height]
         marquee.table = table
         marquee.pathForRow = { [weak coordinator] row in
-            guard let coordinator, coordinator.items.indices.contains(row) else { return nil }
-            return coordinator.items[row].path
+            guard let coordinator else { return nil }
+            return coordinator.hitPath(at: row)
         }
         table.addSubview(marquee)
         scroll.contentView.postsBoundsChangedNotifications = true
@@ -66,7 +70,12 @@ import AppKit
         var parent: FileList
         weak var table: BrowserTable?
         fileprivate var items: [Hit] = []
+        /// Table row of each item. Section headers occupy rows, so this is not
+        /// the same as the item's index in `items`.
         private var rowByPath: [String: Int] = [:]
+        /// Table rows holding a section title rather than a file.
+        private var headerRows: [Int: String] = [:]
+        private var rowCount = 0
         private var updating = false
         private weak var renameField: RenameTextField?
         private var actions: [Int: @MainActor () -> Void] = [:]
@@ -84,6 +93,10 @@ import AppKit
                 renameField?.cancelEditing(); renameField = nil
                 displayedTab = parent.model.id; restoredRoute = nil
             }
+            let next = parent.model.sortedHits
+            table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("where"))?.isHidden =
+                !parent.model.isSearch
+            rebuildRows(next)
             if let hit = parent.model.renaming, let row = rowByPath[hit.path] {
                 updating = true; defer { updating = false }
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
@@ -102,19 +115,15 @@ import AppKit
             }
             if renameField?.editingPath != nil { renameField?.cancelEditing() }
             updating = true; defer { updating = false }
-            let next = parent.model.sortedHits
-            table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("where"))?.isHidden =
-                !parent.model.isSearch
-            if items != next {
-                items = next;
-                rowByPath = Dictionary(
-                    items.enumerated().map { ($0.element.path, $0.offset) },
-                    uniquingKeysWith: { first, _ in first })
-                table.reloadData()
-            }
             let selected = IndexSet(parent.model.selection.compactMap { rowByPath[$0] })
             if table.selectedRowIndexes != selected {
                 table.selectRowIndexes(selected, byExtendingSelection: false)
+            }
+            if displayedTab == parent.model.id, !parent.model.marqueeSelecting,
+                let path = parent.model.focusedPath,
+                let row = rowByPath[path]
+            {
+                table.scrollRowToVisible(row)
             }
             let key: String?
             switch parent.model.sort {
@@ -153,26 +162,79 @@ import AppKit
                     hit, commit: { model.commitRename($0) }, cancel: { model.cancelRename() })
             }
         }
+        /// Map the flat display order onto table rows, reserving a header row
+        /// for each date section. Reload only when rows actually change.
+        private func rebuildRows(_ next: [Hit]) {
+            guard let table else { return }
+            var headers: [Int: String] = [:]
+            var rows: [String: Int] = [:]
+            rows.reserveCapacity(next.count)
+            if let sections = parent.model.groupedSections {
+                var position = 0
+                var row = 0
+                for section in sections {
+                    headers[row] = section.title
+                    row += 1
+                    for hit in section.items {
+                        if position < next.count, next[position].path == hit.path {
+                            rows[hit.path] = row
+                        }
+                        row += 1; position += 1
+                    }
+                }
+                for index in position..<next.count { rows[next[index].path] = row + index - position }
+                row += next.count - position
+            } else {
+                for (index, hit) in next.enumerated() { rows[hit.path] = index }
+            }
+            let count = next.count + headers.count
+            if items != next || headerRows != headers {
+                items = next; rowByPath = rows; headerRows = headers; rowCount = count
+                table.reloadData()
+            } else {
+                rowByPath = rows; rowCount = count
+            }
+        }
+        private func hit(at row: Int) -> Hit? {
+            guard !headerRows.keys.contains(row) else { return nil }
+            let index = row - headerRows.keys.filter { $0 < row }.count
+            return items.indices.contains(index) ? items[index] : nil
+        }
+        fileprivate func hitPath(at row: Int) -> String? { hit(at: row)?.path }
         func rememberScroll() {
             guard !updating, let table, let clip = table.enclosingScrollView?.contentView,
                 !parent.model.loading
             else { return }
-            let row = table.row(at: NSPoint(x: 1, y: clip.bounds.minY + 1))
-            guard items.indices.contains(row) else { return }
+            var row = table.row(at: NSPoint(x: 1, y: clip.bounds.minY + 1))
+            // A section header borrows the position of its first item.
+            while headerRows.keys.contains(row), row + 1 < rowCount { row += 1 }
+            guard let hit = hit(at: row) else { return }
             parent.model.scrollOffset = max(0, clip.bounds.minY - table.rect(ofRow: row).minY)
-            if parent.model.scrollAnchor != items[row].path {
-                parent.model.scrollAnchor = items[row].path
+            if parent.model.scrollAnchor != hit.path {
+                parent.model.scrollAnchor = hit.path
             }
         }
         deinit {
             if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         }
-        func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+        func numberOfRows(in tableView: NSTableView) -> Int { rowCount }
+        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+            headerRows[row] == nil ? 24 : 28
+        }
+        func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+            guard let title = headerRows[row] else { return nil }
+            return FileSectionRowView(title: title)
+        }
+        func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+            headerRows[row] == nil
+        }
         func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int)
             -> NSView?
         {
-            guard items.indices.contains(row), let tableColumn else { return nil }
-            let key = tableColumn.identifier.rawValue, hit = items[row]
+            guard headerRows[row] == nil, let tableColumn else { return nil }
+            let columnIndex = table?.tableColumns.firstIndex(of: tableColumn) ?? 0
+            guard columnIndex == 0, let hit = hit(at: row) else { return nil }
+            let key = tableColumn.identifier.rawValue
             let cell =
                 tableView.makeView(withIdentifier: tableColumn.identifier, owner: self) as? FileCell
                 ?? FileCell(identifier: tableColumn.identifier, withIcon: key == "name")
@@ -214,10 +276,24 @@ import AppKit
             guard !updating, let table else { return }
             parent.model.cancelRename()
             parent.focusFiles(); table.window?.makeFirstResponder(table)
-            parent.model.selection = Set(
-                table.selectedRowIndexes.compactMap {
-                    items.indices.contains($0) ? items[$0].path : nil
-                })
+            let rows = table.selectedRowIndexes.filter { headerRows[$0] == nil }
+            var paths = Set<String>()
+            paths.reserveCapacity(rows.count)
+            for row in rows { if let hit = hit(at: row) { paths.insert(hit.path) } }
+            // Shift-click may report a stale anchor when the model re-sorted
+            // underneath a held selection; keep the model's anchor.
+            if let existing = parent.model.selectionAnchor,
+                paths.contains(existing),
+                table.selectedRowIndexes.count > 1
+            {
+                parent.model.selectionAnchor = existing
+                if let last = table.selectedRowIndexes.last, let path = hit(at: last)?.path {
+                    parent.model.focusedPath = path
+                } else {
+                    parent.model.focusedPath = existing
+                }
+            }
+            parent.model.selection = paths
         }
         func tableView(
             _ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]
@@ -232,24 +308,26 @@ import AppKit
             parent.model.ascending = descriptor.ascending
         }
         @objc func openClicked() {
-            guard let table, items.indices.contains(table.clickedRow) else { return }
-            parent.model.open(items[table.clickedRow])
+            guard let table, table.clickedRow >= 0, let hit = hit(at: table.clickedRow) else {
+                return
+            }
+            parent.model.open(hit)
         }
         func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int)
             -> NSPasteboardWriting?
-        { items.indices.contains(row) ? items[row].url as NSURL : nil }
+        { hit(at: row)?.url as NSURL? }
         func tableView(
             _ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
             proposedDropOperation operation: NSTableView.DropOperation
         ) -> NSDragOperation {
             guard !parent.model.busy else { parent.model.springLoader.cancel(); return [] }
+            let target = row >= 0 ? hit(at: row) : nil
             parent.model.hoverFolder(
-                operation == .on && items.indices.contains(row) && items[row].isFolder
-                    ? items[row].url : nil)
+                operation == .on && target?.isFolder == true ? target!.url : nil)
             if operation == .on {
-                guard items.indices.contains(row), items[row].isFolder else { return [] }
+                guard target?.isFolder == true else { return [] }
             } else {
-                guard row >= items.count, parent.model.canWriteHere else { return [] }
+                guard row >= rowCount, parent.model.canWriteHere else { return [] }
                 tableView.setDropRow(-1, dropOperation: .on)
             }
             return NSEvent.modifierFlags.contains(.option)
@@ -261,9 +339,11 @@ import AppKit
         ) -> Bool {
             parent.model.springLoader.cancel()
             let destination: URL
-            if operation == .on && items.indices.contains(row) && items[row].isFolder {
-                destination = items[row].url
-            } else if parent.model.canWriteHere && (row == -1 || row >= items.count) {
+            if operation == .on, let target = row >= 0 ? hit(at: row) : nil,
+                target.isFolder
+            {
+                destination = target.url
+            } else if parent.model.canWriteHere && (row == -1 || row >= rowCount) {
                 destination = parent.model.location
             } else {
                 return false
@@ -294,7 +374,7 @@ import AppKit
                 return item
             }
             menu.autoenablesItems = false
-            if !items.indices.contains(row) {
+            if hit(at: row) == nil {
                 let writable = model.canWriteHere && !model.busy
                 add("New Folder", enabled: writable) { model.newFolder() }
                 add("New Text File", enabled: writable) { model.newTextFile() }
@@ -315,7 +395,7 @@ import AppKit
                 }
                 let viewItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
                 viewItem.submenu = views; menu.addItem(viewItem)
-                let hidden = add("Show Hidden Files") { model.showHidden.toggle() }
+                let hidden = add("Show Hidden Files  ⌘H") { model.toggleHidden() }
                 hidden.state = model.showHidden ? .on : .off
                 add("Refresh", enabled: !model.busy) { model.schedule() }
                 return menu
@@ -323,7 +403,7 @@ import AppKit
             if !table.selectedRowIndexes.contains(row) {
                 table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             }
-            let hit = items[row]
+            guard let hit = hit(at: row) else { return menu }
             add("Open") { model.open(hit) }
             if !hit.isFolder {
                 let applications = NSMenu(); applications.autoenablesItems = false
@@ -371,6 +451,12 @@ import AppKit
     let marquee = MarqueeSelectionView()
     var menuProvider: ((Int) -> NSMenu?)?
     var dragExit: (() -> Void)?
+    var focusHandler: (() -> Void)?
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { focusHandler?() }
+        return accepted
+    }
     override func draggingExited(_ sender: NSDraggingInfo?) {
         dragExit?(); super.draggingExited(sender)
     }
@@ -381,6 +467,27 @@ import AppKit
         let point = convert(event.locationInWindow, from: nil)
         return menuProvider?(row(at: point))
     }
+}
+/// Full-width date header drawn by the table's row view.
+@MainActor final class FileSectionRowView: NSTableRowView {
+    private let label: NSTextField
+    init(title: String) {
+        label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        super.init(frame: .zero)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var isEmphasized: Bool { get { false } set {} }
+    override var isSelected: Bool { get { false } set {} }
 }
 @MainActor final class FileCell: NSTableCellView {
     var path = ""

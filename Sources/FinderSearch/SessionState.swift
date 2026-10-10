@@ -10,6 +10,7 @@ struct TabSession: Codable, Equatable {
     var sort: String
     var ascending: Bool
     var hidden: Bool
+    var grouping: String?
     var selection: Set<String>
     var scrollAnchor: String?
     var scrollOffset: Double
@@ -18,6 +19,7 @@ struct TabSession: Codable, Equatable {
         path = model.location.path; route = model.route; query = model.query; scope = model.scope
         view = model.viewMode.rawValue
         sort = model.sort.rawValue; ascending = model.ascending; hidden = model.showHidden
+        grouping = model.grouping.rawValue
         selection = model.selection; scrollAnchor = model.scrollAnchor
         scrollOffset = model.scrollOffset
     }
@@ -30,6 +32,9 @@ struct TabSession: Codable, Equatable {
         model.viewMode = FileViewMode(rawValue: view) ?? .icons
         model.sort = FileSort(rawValue: sort) ?? .name
         model.ascending = ascending; model.showHidden = hidden
+        if let grouping, let value = FileGrouping(rawValue: grouping) {
+            model.setGrouping(value)
+        }
         model.selection = selection; model.scrollAnchor = scrollAnchor
         model.scrollOffset = scrollOffset
         return model

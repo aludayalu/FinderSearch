@@ -435,6 +435,59 @@ enum LocalFiles {
 }
 
 enum FileOrdering {
+    /// Windows Explorer-style Downloads buckets, newest first.
+    enum DateBucket: Int, CaseIterable {
+        case today, yesterday, thisWeek, lastWeek, thisMonth, lastMonth, earlier
+        var title: String {
+            switch self {
+            case .today: return "Today"
+            case .yesterday: return "Yesterday"
+            case .thisWeek: return "Earlier This Week"
+            case .lastWeek: return "Last Week"
+            case .thisMonth: return "Earlier This Month"
+            case .lastMonth: return "Last Month"
+            case .earlier: return "Earlier"
+            }
+        }
+        static func bucket(
+            mtime: UInt64, now: Date = Date(), calendar: Calendar = .current
+        ) -> DateBucket {
+            let modified = Date(timeIntervalSince1970: Double(mtime))
+            if calendar.isDate(modified, inSameDayAs: now) { return .today }
+            if let day = calendar.date(byAdding: .day, value: -1, to: now),
+                calendar.isDate(modified, inSameDayAs: day)
+            { return .yesterday }
+            if calendar.isDate(modified, equalTo: now, toGranularity: .weekOfYear) {
+                return .thisWeek
+            }
+            if let week = calendar.date(byAdding: .weekOfYear, value: -1, to: now),
+                calendar.isDate(modified, equalTo: week, toGranularity: .weekOfYear)
+            { return .lastWeek }
+            if calendar.isDate(modified, equalTo: now, toGranularity: .month) { return .thisMonth }
+            if let month = calendar.date(byAdding: .month, value: -1, to: now),
+                calendar.isDate(modified, equalTo: month, toGranularity: .month)
+            { return .lastMonth }
+            return .earlier
+        }
+    }
+
+    /// Bucket an already-ordered run into date sections. Order within and
+    /// across buckets is preserved; empty buckets are omitted.
+    static func sections(
+        _ ordered: [Hit], now: Date = Date(), calendar: Calendar = .current
+    ) -> [FileSection] {
+        var groups: [(DateBucket, [Hit])] = []
+        for hit in ordered {
+            let bucket = DateBucket.bucket(mtime: hit.mtime, now: now, calendar: calendar)
+            if let last = groups.last, last.0 == bucket {
+                groups[groups.count - 1].1.append(hit)
+            } else {
+                groups.append((bucket, [hit]))
+            }
+        }
+        return groups.map { FileSection(title: $0.0.title, items: $0.1) }
+    }
+
     struct Cache {
         let source: [Hit]
         let ordered: [Hit]
@@ -549,6 +602,11 @@ enum FileOrdering {
         let ordered = try entries.sorted { a, b in
             comparisons += 1
             if comparisons % 1024 == 0 { try Task.checkCancellation() }
+            // The default name sort keeps folders on top, each group by name.
+            if sort == .name, a.hit.isFolder != b.hit.isFolder {
+                let foldersFirst = a.hit.isFolder && !b.hit.isFolder
+                return ascending ? foldersFirst : !foldersFirst
+            }
             let comparison: ComparisonResult
             switch sort {
             case .modified:
